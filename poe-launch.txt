@@ -1,0 +1,5 @@
+# Path of Exile (Steam) launch options — archiwum, NIE EDYTUJ
+# Skopiuj 1:1 do Steam → PoE → Properties → Launch Options
+# Backup też w: _backup_2026-05-26_1014/steam/poe-launch-options.txt
+
+taskset -c 1-6,9-14 env VKD3D_SWAPCHAIN_PRESENT_MODE=FIFO VKD3D_CONFIG=no_upload_hvv,force_host_cached,pipeline_library_app_cache RADV_PERFTEST=nircache,nggc MESA_SHADER_CACHE_MAX_SIZE=69G /home/grruwi/Dokumenty/skrypcipki/wine-nice.sh mangohud WINE_CPU_TOPOLOGY=12:1,2,3,4,5,6,9,10,11,12,13,14 %command%

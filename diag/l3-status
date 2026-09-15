@@ -1,0 +1,138 @@
+#!/bin/bash
+# L3 cache occupancy snapshot — kto ile zajmuje + jakie limity
+# Auto-tworzy mon_groups + refresh PIDy przy kazdym uruchomieniu (idempotent)
+# Uzycie: l3-status  |  watch -n1 l3-status  |  alias l3w='watch -n1 l3-status'
+
+L3_SIZE_MB=96
+
+# 1. Auto-mount resctrl jesli trzeba
+if ! mountpoint -q /sys/fs/resctrl; then
+    sudo mount -t resctrl resctrl /sys/fs/resctrl 2>/dev/null || {
+        echo "Nie udalo sie zamontowac resctrl. Sprawdz: sudo mount -t resctrl resctrl /sys/fs/resctrl"
+        exit 1
+    }
+fi
+
+# Self-cap: wpisz wlasny PID do l3w CTRL group (cap 0 ways) zeby skrypt sam nie zanieczyszczal pomiaru.
+# Dziedziczone przez fork/clone do wszystkich child procesow (sudo, awk, cat, pgrep)
+[ -d /sys/fs/resctrl/l3w ] && echo $$ | sudo tee /sys/fs/resctrl/l3w/tasks >/dev/null 2>&1
+
+# 2. Definicje grup -> jak znalezc PIDy
+get_pids() {
+    case "$1" in
+        poe)
+            # cala cgroup Steam zawiera PoE main + wine + steamwebhelper - rozdzielimy ponizej
+            cg=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@autostart.service/cgroup.procs
+            [ -r "$cg" ] || return
+            # tylko procesy ktore NIE sa Steam UI (renderery, networking, helpers)
+            for p in $(cat "$cg" 2>/dev/null); do
+                c=$(ps -o comm= -p "$p" 2>/dev/null)
+                case "$c" in
+                    steam|steamwebhelper|Xwayland|srt-*|pv-*|reaper|python3) ;;
+                    *) echo "$p" ;;
+                esac
+            done
+            ;;
+        steam)
+            # Steam UI/helpers - oddzielnie zeby nie brudzic poe occupancy
+            cg=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@autostart.service/cgroup.procs
+            [ -r "$cg" ] || return
+            for p in $(cat "$cg" 2>/dev/null); do
+                c=$(ps -o comm= -p "$p" 2>/dev/null)
+                case "$c" in
+                    steam|steamwebhelper|Xwayland|srt-*|pv-*|reaper) echo "$p" ;;
+                esac
+            done
+            ;;
+        kwin)    pgrep -x kwin_wayland ;;
+        plasma)  pgrep -x plasmashell ;;
+        audio)   pgrep -x pipewire; pgrep -x wireplumber; pgrep -x pipewire-pulse ;;
+        claude)  pgrep -x claude.original; pgrep -f "claude/versions/[0-9]"; pgrep -f "/Dokumenty/klodzio/" ;;
+        spotify) pgrep -x spotify ;;
+        discord) pgrep -x Discord ;;
+        firefox) pgrep -x firefox ;;
+        konsole) pgrep -x konsole ;;
+        kde)     pgrep -x kded6; pgrep -x kdeconnectd; pgrep -x ksecretd; pgrep -x baloo_file; pgrep -f 'kio_|polkit-kde|plasma-browser|kactivity' ;;
+        scx)     pgrep -x scxtop; pgrep -x scx-manager; pgrep -x scx_loader; pgrep -x scx_rusty; pgrep -x scx_layered; pgrep -x scx_lavd ;;
+        apt)     pgrep -f 'awakened-poe-trade|/usr/lib/electron40' ;;  # PoE trade overlay
+        lact)    pgrep -x lact ;;
+        sys)     pgrep -x systemd; pgrep -f 'systemd-journal|systemd-udevd|systemd-oomd|systemd-resolve|systemd-logind|systemd-timesyn|dbus-broker|NetworkManager|bpftune|polkitd|xdg-desktop-port' ;;
+        gpu_k)   pgrep -f 'kworker.*(amdgpu|gfx_|comp_|dm_hpd|drm)' ;;       # GPU kernel threads (amdgpu driver pracuje tu)
+        btrfs)   pgrep -f 'kworker.*(btrfs|writeback)' ;;                    # filesystem IO completion
+        softirq) pgrep -f 'ksoftirqd|rcu_preempt|rcu_sched|rcuos|rcuop' ;;   # per-CPU softirq + RCU
+        kworker) pgrep -x kworker 2>/dev/null; pgrep -f 'kworker.*events' ;; # generic kernel work (catch-all)
+        l3w)     echo $$; pgrep -f 'watch.*l3-status' ;;                     # samo skrypt + watch wrapper (cap 0)
+    esac
+}
+
+GRPS=(poe steam claude kwin plasma audio spotify discord firefox konsole kde scx apt lact sys gpu_k btrfs softirq kworker l3w)
+
+# 3. Stworz mon_groups jesli nie istnieja (idempotent)
+for g in "${GRPS[@]}"; do
+    [ -d "/sys/fs/resctrl/mon_groups/$g" ] || sudo mkdir -p "/sys/fs/resctrl/mon_groups/$g" 2>/dev/null
+done
+
+# Mapowanie nazw grup -> CTRL group (gdy grupa ma cap CAT)
+#   claude  -> klodzio  (historyczne)
+#   spotify -> spotify  (pasuje)
+#   discord -> discord
+#   firefox -> firefox
+# Funkcja zwraca nazwe CTRL group jesli istnieje, inaczej puste
+ctrl_for() {
+    case "$1" in
+        claude) [ -d /sys/fs/resctrl/klodzio ] && echo klodzio ;;
+        *)      [ -d "/sys/fs/resctrl/$1" ] && echo "$1" ;;
+    esac
+}
+
+# 4. Refresh PIDy (TIDs zeby zlapac multi-threaded)
+#    Jesli grupa ma CTRL - wpisuje PIDy do CTRL/tasks (zachowuje cap)
+#    Jesli nie ma CTRL - wpisuje do mon_groups/X/tasks (tylko monitoring)
+#    resctrl/tasks wymaga 1 PID per write() syscall - stad pętla wewnatrz sudo
+for g in "${GRPS[@]}"; do
+    [ -d "/sys/fs/resctrl/mon_groups/$g" ] || continue
+    ctrl=$(ctrl_for "$g")
+    target="/sys/fs/resctrl/mon_groups/$g/tasks"
+    [ -n "$ctrl" ] && target="/sys/fs/resctrl/$ctrl/tasks"
+
+    tids=""
+    for pid in $(get_pids "$g"); do
+        [ -d "/proc/$pid/task" ] || continue
+        for tid_path in /proc/$pid/task/*; do
+            tids+="$(basename "$tid_path") "
+        done
+    done
+    [ -z "$tids" ] && continue
+    sudo bash -c "for t in $tids; do echo \$t > $target 2>/dev/null; done"
+done
+
+# 5. Snapshot
+printf "\n%-10s %8s %7s   %s\n" "GROUPA" "L3 MB" "%96MB" "PIDy"
+printf -- "---------- -------- -------   ------\n"
+
+for g in "${GRPS[@]}"; do
+    ctrl=$(ctrl_for "$g")
+    if [ -n "$ctrl" ]; then
+        f="/sys/fs/resctrl/$ctrl/mon_data/mon_L3_00/llc_occupancy"
+        cap_info=" [CAP $(grep -oE 'L3:.*' /sys/fs/resctrl/$ctrl/schemata)]"
+    else
+        f="/sys/fs/resctrl/mon_groups/$g/mon_data/mon_L3_00/llc_occupancy"
+        cap_info=""
+    fi
+    [ -r "$f" ] || continue
+    b=$(cat "$f")
+    n=$(get_pids "$g" | wc -l)
+    awk -v b="$b" -v g="$g" -v n="$n" -v sz="$L3_SIZE_MB" -v cap="$cap_info" \
+        'BEGIN{printf "%-10s %8.1f %6.1f%%   %d%s\n", g, b/1048576, b/1048576/sz*100, n, cap}'
+done
+
+# default (rest)
+b_def=$(cat /sys/fs/resctrl/mon_data/mon_L3_00/llc_occupancy)
+awk -v b="$b_def" -v sz="$L3_SIZE_MB" \
+    'BEGIN{printf "%-10s %8.1f %6.1f%%   %s\n", "DEFAULT*", b/1048576, b/1048576/sz*100, "rest"}'
+
+echo
+echo "* DEFAULT = kernel, scxtop, lact, mangohud, gpu drv, systemd, kthreads"
+echo
+echo "Schemata: $(grep -oE 'L3:.*' /sys/fs/resctrl/schemata)"
+echo "Decode: 1 way = 6MB | ffff=16 (96MB) | 3fff=14 (84MB) | 1fff=13 (78MB)"

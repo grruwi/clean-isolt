@@ -1,0 +1,120 @@
+================================================================================
+clean isolt — CPU isolation + tuning. Ryzen 7 9800X3D (single CCD, 8C/16T, 1×L3 96MB V-Cache)
+Stan: 2026-06-14 — zreconciliowane z żywym systemem (/proc/cmdline, sysfs, systemctl).
+Lekcja: kwin+audio razem na 0,8 = trzy rzeczy ~RT na jednym rdzeniu → artefakty/trzaski.
+        Dlatego kwin → 7,15, audio samo → 0,8.
+================================================================================
+CO TU JEST (aktywne skrypty)                          GDZIE / SERWIS
+================================================================================
+cpu-map.txt        ← czytasz to                       clean isolt/
+hardware.sh        NVMe queue+IRQ tuning, GPU IRQ→0    clean isolt/  (hardware.service, active)
+nic-latency.sh     eno1 IRQ→7,15 by-name + ethtool     clean isolt/  (nic-latency.service, active)
+systemd-prepare.sh czyści+generuje wrappery aplikacji  clean isolt/  (user, oneshot, enabled)
+post-plasma.sh     runtime pinning po starcie KDE      clean isolt/  (user, enabled)
+free-xwayland.sh   Xwayland pinning                    clean isolt/  (user, enabled)
+mango-depin.sh     re-pin wątków MangoHud z PoE→7,15   clean isolt/  (⚠️ status niepewny — patrz WATCH)
+wine-nice.sh       PoE: renice wineserver -12 + FIFO41 ~/Dokumenty/skrypcipki/wine-nice.sh
+                   (Steam launch options pinują tę ścieżkę 1:1 — NIE RUSZAĆ)
+wrappers/          wygenerowane taskset+nice wrappery   clean isolt/wrappers/
+diag/l3-status     diagnostyka pinningu                clean isolt/diag/
+
+================================================================================
+ARCHITEKTURA CPU
+================================================================================
+
+CPU 0,8       ← KERNEL POOL + AUDIO
+  audio:    pipewire / wireplumber / pipewire-pulse → CPUAffinity=0 8, pipewire Nice=-11 (RT)
+            (drop-iny: ~/.config/systemd/user/{pipewire,wireplumber,pipewire-pulse}.service.d/)
+  claude:   CLI taskset 0,8
+  GPU IRQ:  amdgpu → CPU 0          (hardware.sh)
+  NVMe:     admin queue q0 → 0,8    (hardware.sh)
+
+CPU 7,15      ← KOMPOZYTOR + ŚMIETNIK
+  procesy:  kwin_wayland (SCHED_RR 1, nice -12), plasmashell (nice -6)
+            electrony (discord/spotify/firefox/chatterino/steam/konsole) — taskset 0,7,8,15
+  hard IRQ: eno1 NIC → 7,15 (nic-latency.sh, by-name) + reszta przez cmdline irqaffinity
+
+CPU 1-6,9-14  ← POE POOL (ekskluzywny, 12 wątków na 6 fizycznych rdzeniach)
+  procesy:    wyłącznie PoE (Steam: taskset -c 1-6,9-14)
+  wineserver: taskset 0-15 (lightweight sync), renice -12, FIFO 41 (NIE 99 — 99 wywłaszcza GPU IRQ)
+  L3:         pełen 96MB, brak capów (L3-CAT wycofany)
+
+================================================================================
+KERNEL CMDLINE
+================================================================================
+Źródło prawdy (persist): /etc/sdboot-manage.conf → LINUX_OPTIONS
+  (sdboot-manage przepisuje /boot/loader/entries/*.conf z tego przy każdym update)
+
+Isolation-relevant (live, zweryfikowane):
+  irqaffinity=0,7,8,15         (GPU IRQ→0 dokłada hardware.sh runtime)
+  systemd.cpu_affinity=0,7,8,15
+  processor.max_cstate=1       (eliminuje idle frame drop, 0.1% low)
+Reszta: amdgpu.cwsr_enable=0 / gpu_recovery=1 / ppfeaturemask=0xffffffff, amd_pstate=active,
+        mitigations=off, split_lock_detect=off, transparent_hugepage=madvise,
+        pci=pcie_bus_perf, nvme_core.default_ps_max_latency_us=0, usbhid.mousepoll=4, zswap.enabled=0
+
+⚠️ threadirqs jest w /proc/cmdline (potrzebne hardware.sh do demote NVMe IRQ FIFO→OTHER),
+   ale NIE MA go w LINUX_OPTIONS → zniknie po następnym sdboot-manage rewrite. Patrz WATCH.
+
+================================================================================
+hardware.sh (hardware.service, boot oneshot) — JEDNO ŹRÓDŁO sprzętowego tuningu
+================================================================================
+Zastąpił dawne udev rules (60-nvme / 61-gpu — psuły się exit 1 przez systemd-run).
+  1. NVMe queue: scheduler=kyber, nr_requests=512, nomerges=0, iostats=0,
+                 read_ahead_kb=128, rq_affinity=1, wbt_lat_usec=0
+                 (kyber + wbt0 = storm killer; wcześniej none/rq2/nomerges2 klobrowało writes)
+  2. NVMe IRQ threads: FIFO 50 → SCHED_OTHER (cache locality zostaje, nie wywłaszcza RT audio/PoE)
+  3. amdgpu IRQ → CPU 0
+  4. NVMe admin queue q0 → CPU 0,8
+  NIE rusza: pp_power_profile_mode (właściciel = LACT/lactd, trzyma CUSTOM)
+
+NVMe: pliku udev BRAK (60-nvme-performance.rules nie istnieje) — całość robi hardware.sh.
+
+================================================================================
+nic-latency.sh (nic-latency.service) — eno1 / Intel I226-V
+================================================================================
+ethtool: rx-usecs 0, gro/gso/tso off
+eno1 IRQ → 7,15 PO NAZWIE (nie po numerze — numery IRQ dryfują między kernelami; stary unit
+  z hardkodem 100/101 wrzucał NIC IRQ na CPU 12 = PoE pool → storm per-pakiet przy każdym
+  hicie w moby. TO był bug którego szukaliśmy tygodniami. Naprawione 06-10, by-name.)
+
+================================================================================
+FRAME PACING — dlaczego AllowTearing=false + ICC kolor jest lepszy
+================================================================================
+4-warstwowy stack:
+  1. GPL — Shader Pipeline Library (async)
+  2. VKD3D Proton 11+ frame buffer — IMMEDIATE present mode + wbudowany pacing
+  3. KWin compositor (AllowTearing=false) — dodatkowy bufor pacing
+  4. FreeSync/VRR monitor (HDMI-A-1 vrrPolicy=Automatic)
+KWin jako bufor = FEATURE. Bez ICC profilu koloru → inny render path, gorszy pacing.
+no_staggered_submit ZBĘDNE na Proton 11+ (VKD3D 3.0.1+).
+
+================================================================================
+PoE LAUNCH OPTIONS (Steam)
+================================================================================
+taskset -c 1-6,9-14 env VKD3D_CONFIG=no_upload_hvv \
+  MESA_SHADER_CACHE_MAX_SIZE=69G \
+  "/home/grruwi/Dokumenty/skrypcipki/clean isolt/wine-nice.sh" mangohud \
+  WINE_CPU_TOPOLOGY=12:1,2,3,4,5,6,9,10,11,12,13,14 %command%
+
+================================================================================
+KDE (GUI = źródło prawdy)
+================================================================================
+Display & Monitor:
+  - "Allow Tearing" → ODZNACZONE  (kwin jako bufor pacing — POŻĄDANE)
+  - Color profile   → WŁĄCZONY    (ICC, oba monitory)
+HDMI-A-1 (1440p): vrrPolicy=Automatic | DP-1 (1080p): vrrPolicy=Never
+
+================================================================================
+INNE
+================================================================================
+IOMMU = DISABLED w BIOS  ⚠️ NIE WŁĄCZAĆ
+  enabled → GPU host translation cache overhead + spajki latency + ~10% mniej FPS.
+  Bez VM/VFIO = pure overhead, zero korzyści. Wyłączać w BIOS, nie w kernelu.
+
+================================================================================
+WATCH / TODO
+================================================================================
+1. threadirqs → dopisać do LINUX_OPTIONS (patrz KERNEL CMDLINE), inaczej zniknie po update.
+2. mango-depin.sh — status niepewny ("chyba nie działa"); zweryfikować czy re-pina, albo wyjebać.
+================================================================================
